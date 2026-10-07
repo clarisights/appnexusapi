@@ -6,6 +6,12 @@ class AppnexusApi::Connection
   attr_accessor :update_token
 
   RATE_EXCEEDED_DEFAULT_TIMEOUT = 15
+  # Rate-limited retries of one request before giving up.
+  MAX_RATE_EXCEEDED_RETRIES = 20
+  # Seconds; overridable with config 'timeout' / 'open_timeout'. Without them
+  # a hung request (e.g. under the Typhoeus adapter) never returns.
+  DEFAULT_TIMEOUT = 300
+  DEFAULT_OPEN_TIMEOUT = 30
   # Inexplicably, sandbox uses the correct code of 429, while production uses 405? so
   # we just rely on the error message
   RATE_EXCEEDED_ERROR = 'RATE_EXCEEDED'.freeze
@@ -17,14 +23,16 @@ class AppnexusApi::Connection
     @logger = @config['logger'] || NullLogger.instance
     @token = @config['token']
     @connection = Faraday.new(@config['uri']) do |conn|
+      conn.options.timeout = @config.fetch('timeout', DEFAULT_TIMEOUT)
+      conn.options.open_timeout = @config.fetch('open_timeout', DEFAULT_OPEN_TIMEOUT)
       conn.response :logger, @logger, bodies: true
       conn.request :json
-      # Registered before :json so it sees the parsed body: response
-      # middleware completes from the last registered to the first.
-      conn.use AppnexusApi::Faraday::Response::RaiseHttpError
       conn.response :json, :content_type => /\bjson$/
+      # Registered after :json, so it runs first on the raw response: an error
+      # status is mapped even when the body isn't valid JSON.
+      conn.use AppnexusApi::Faraday::Response::RaiseHttpError
       conn.adapter Faraday.default_adapter
-    end 
+    end
     update_token_if_expired
   end
 
@@ -37,7 +45,7 @@ class AppnexusApi::Connection
   end
 
   def expired?
-    response = @connection.run_request(:get, 'member', {}, { 'Authorization' => @token })
+    response = faraday_request(:get, 'member', {}, { 'Authorization' => @token })
     log.debug(response.body)
     return true if response.body['response']['error_code'] == 'NOAUTH'
   rescue AppnexusApi::Unauthorized
@@ -51,7 +59,7 @@ class AppnexusApi::Connection
   end
 
   def login
-    response = @connection.run_request(:post, 'auth', { 'auth' => { 'username' => @config['username'], 'password' => @config['password'] } }, {})
+    response = faraday_request(:post, 'auth', { 'auth' => { 'username' => @config['username'], 'password' => @config['password'] } }, {})
     log.debug(response.body)
     if response.body['response']['error_code']
       fail "#{response.body['response']['error_code']}/#{response.body['response']['error_description']}"
@@ -88,6 +96,7 @@ class AppnexusApi::Connection
     update_token_if_expired
     response = {}
     begin
+      rate_exceeded = 0
       loop do
         response = run_request_only(
           method,
@@ -95,11 +104,16 @@ class AppnexusApi::Connection
           body,
           { 'Authorization' => @token }.merge(headers)
         )
-        break if response.body.empty? # Log level data download service returns a body of ""
-        break unless response.body.fetch('response', {})['error_code'] == RATE_EXCEEDED_ERROR
+        break unless rate_exceeded?(response.body)
+
+        rate_exceeded += 1
+        if rate_exceeded > MAX_RATE_EXCEEDED_RETRIES
+          raise AppnexusApi::RateLimited, "#{method.to_s.upcase} #{route}: still rate limited after #{MAX_RATE_EXCEEDED_RETRIES} retries"
+        end
         wait_time = response.headers['retry-after'] || RATE_EXCEEDED_DEFAULT_TIMEOUT
         log.info("received rate exceeded.  wait time: #{wait_time}s")
-        sleep wait_time.to_i
+        # An HTTP-date Retry-After becomes 0; never retry without waiting.
+        sleep [wait_time.to_i, 1].max
       end
     rescue AppnexusApi::Unauthorized => e
       if @retry == true
@@ -109,8 +123,6 @@ class AppnexusApi::Connection
         logout
         response = run_request(method, route, body, headers)
       end
-    rescue Faraday::TimeoutError => _e
-      raise AppnexusApi::Timeout, 'Timeout'
     ensure
       @retry = false
     end
@@ -119,11 +131,30 @@ class AppnexusApi::Connection
   end
 
   def run_request_only(method, route, body, headers)
-    @connection.run_request(
+    faraday_request(
       method,
       route,
       body,
       { 'Authorization' => @token }.merge(headers)
     )
+  end
+
+  private
+
+  # The log level data download service returns an empty body; other
+  # non-Hash bodies (e.g. text) can't carry an error code either.
+  def rate_exceeded?(body)
+    body.is_a?(Hash) && body.fetch('response', {})['error_code'] == RATE_EXCEEDED_ERROR
+  end
+
+  # Faraday's request, with its transport errors raised as AppnexusApi errors.
+  def faraday_request(method, route, body, headers)
+    @connection.run_request(method, route, body, headers)
+  rescue Faraday::TimeoutError
+    raise AppnexusApi::Timeout, 'Timeout'
+  rescue Faraday::ParsingError => e
+    raise AppnexusApi::InvalidJson, e.message
+  rescue Faraday::ConnectionFailed, Faraday::SSLError => e
+    raise AppnexusApi::ConnectionFailed, e.message
   end
 end
