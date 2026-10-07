@@ -1,7 +1,7 @@
 module AppnexusApi
   module Faraday
     module Response
-      class RaiseHttpError < ::Faraday::Response::Middleware
+      class RaiseHttpError < ::Faraday::Middleware
         def on_complete(response)
           case response[:status].to_i
           when 400

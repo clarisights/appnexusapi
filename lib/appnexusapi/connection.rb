@@ -1,4 +1,3 @@
-require 'faraday_middleware'
 require 'appnexusapi/faraday/raise_http_error'
 require 'null_logger'
 
@@ -20,8 +19,10 @@ class AppnexusApi::Connection
     @connection = Faraday.new(@config['uri']) do |conn|
       conn.response :logger, @logger, bodies: true
       conn.request :json
-      conn.response :json, :content_type => /\bjson$/
+      # Registered before :json so it sees the parsed body: response
+      # middleware completes from the last registered to the first.
       conn.use AppnexusApi::Faraday::Response::RaiseHttpError
+      conn.response :json, :content_type => /\bjson$/
       conn.adapter Faraday.default_adapter
     end 
     update_token_if_expired
@@ -108,7 +109,7 @@ class AppnexusApi::Connection
         logout
         response = run_request(method, route, body, headers)
       end
-    rescue Faraday::Error::TimeoutError => _e
+    rescue Faraday::TimeoutError => _e
       raise AppnexusApi::Timeout, 'Timeout'
     ensure
       @retry = false
