@@ -1,39 +1,58 @@
+require 'json'
+
 module AppnexusApi
   module Faraday
     module Response
-      class RaiseHttpError < ::Faraday::Response::Middleware
+      # Raises an AppnexusApi error for an HTTP error status. It runs before the
+      # :json response middleware, so it reads the raw body itself.
+      class RaiseHttpError < ::Faraday::Middleware
+        ERRORS = {
+          400 => AppnexusApi::BadRequest,
+          401 => AppnexusApi::Unauthorized,
+          403 => AppnexusApi::Forbidden,
+          404 => AppnexusApi::NotFound,
+          406 => AppnexusApi::NotAcceptable,
+          422 => AppnexusApi::UnprocessableEntity,
+          500 => AppnexusApi::InternalServerError,
+          501 => AppnexusApi::NotImplemented,
+          502 => AppnexusApi::BadGateway,
+          503 => AppnexusApi::ServiceUnavailable
+        }.freeze
+        # Production signals rate limiting with 405 (sandbox with 429) and a
+        # RATE_EXCEEDED error_code; Connection#run_request waits and retries.
+        RATE_LIMIT_STATUSES = [405, 429].freeze
+
         def on_complete(response)
-          case response[:status].to_i
-          when 400
-            raise AppnexusApi::BadRequest, error_message(response)
-          when 401
-            raise AppnexusApi::Unauthorized, error_message(response)
-          when 403
-            raise AppnexusApi::Forbidden, error_message(response)
-          when 404
-            raise AppnexusApi::NotFound, error_message(response)
-          when 406
-            raise AppnexusApi::NotAcceptable, error_message(response)
-          when 422
-            raise AppnexusApi::UnprocessableEntity, error_message(response)
-          when 500
-            raise AppnexusApi::InternalServerError, error_message(response)
-          when 501
-            raise AppnexusApi::NotImplemented, error_message(response)
-          when 502
-            raise AppnexusApi::BadGateway, error_message(response)
-          when 503
-            raise AppnexusApi::ServiceUnavailable, error_message(response)
+          status = response[:status].to_i
+          error = ERRORS.fetch(status) do
+            AppnexusApi::Error if status >= 400 && !RATE_LIMIT_STATUSES.include?(status)
           end
+          raise error, error_message(response) if error
         end
 
         def error_message(response)
-          msg = "#{response[:method].to_s.upcase} #{response[:url].to_s}: #{response[:status]}"
-          if errors = response[:body] && response[:body]["errors"]
-            msg << "\n"
-            msg << errors.join("\n")
-          end
+          msg = "#{response[:method].to_s.upcase} #{response[:url]}: #{response[:status]}"
+          details = error_details(parsed_body(response[:body]))
+          msg << "\n" << details.join("\n") if details.any?
           msg
+        end
+
+        private
+
+        # AppNexus reports errors as {"response": {"error_id", "error_code", "error"}}.
+        def error_details(body)
+          return [] unless body.is_a?(Hash)
+
+          api = body['response'].is_a?(Hash) ? body['response'] : {}
+          Array(body['errors']) + api.values_at('error_id', 'error_code', 'error').compact
+        end
+
+        def parsed_body(body)
+          return body unless body.is_a?(String)
+
+          JSON.parse(body)
+        rescue JSON::ParserError
+          nil
         end
       end
     end

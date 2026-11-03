@@ -15,8 +15,9 @@ Gem::Specification.new do |gem|
   gem.require_paths = ["lib"]
   gem.version       = AppnexusApi::VERSION
 
-  gem.add_dependency 'faraday', '>= 0.17.3', '< 2.0'
-  gem.add_dependency 'faraday_middleware'
+  # Faraday 2 ships the :json request/response middleware that
+  # faraday_middleware provided for 1.x.
+  gem.add_dependency 'faraday', '>= 2.0', '< 3'
   gem.add_dependency 'multi_json'
   gem.add_dependency 'pester'
   gem.add_dependency 'null_logger'
